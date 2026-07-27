@@ -385,3 +385,108 @@ func TestConcurrentDifferentKeysAllRun(t *testing.T) {
 		t.Fatalf("handler ran %d times, want %d", calls.Load(), n)
 	}
 }
+
+// TestStoreClaimSingleLeaderUnderStampede exercises the store primitive on its
+// own: under a stampede on one key, Claim must hand leadership to exactly one
+// caller. This is the atomic guarantee the whole middleware rests on, tested
+// here without the middleware in the way. Run with -race.
+func TestStoreClaimSingleLeaderUnderStampede(t *testing.T) {
+	store := NewMemoryStore(time.Hour, 0)
+
+	const n = 200
+	var leaders atomic.Int64
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, leader := store.Claim("k1", "fp"); leader {
+				leaders.Add(1)
+			}
+		}()
+	}
+	wg.Wait()
+
+	if leaders.Load() != 1 {
+		t.Fatalf("Claim granted leadership %d times, want exactly 1", leaders.Load())
+	}
+}
+
+// TestConcurrentManyKeysEachExecuteOnce runs a stampede across many distinct
+// keys at once, each key hit by several concurrent duplicates. Every key must
+// execute exactly once no matter how the duplicates interleave. Run with -race.
+func TestConcurrentManyKeysEachExecuteOnce(t *testing.T) {
+	var perKey sync.Map // key -> *atomic.Int64
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, _ := perKey.LoadOrStore(r.Header.Get(HeaderKey), &atomic.Int64{})
+		c.(*atomic.Int64).Add(1)
+		time.Sleep(2 * time.Millisecond) // widen the in-flight window
+		w.Write([]byte("ok"))
+	})
+	mw, _ := wrap(h)
+
+	const keys = 32
+	const dupes = 8
+	var wg sync.WaitGroup
+	for k := 0; k < keys; k++ {
+		for d := 0; d < dupes; d++ {
+			wg.Add(1)
+			go func(k int) {
+				defer wg.Done()
+				rec := httptest.NewRecorder()
+				mw.ServeHTTP(rec, newReq("POST", "/pay", fmt.Sprintf("key-%d", k), "amount=10"))
+			}(k)
+		}
+	}
+	wg.Wait()
+
+	for k := 0; k < keys; k++ {
+		key := fmt.Sprintf("key-%d", k)
+		c, ok := perKey.Load(key)
+		if !ok {
+			t.Fatalf("%s never executed", key)
+		}
+		if got := c.(*atomic.Int64).Load(); got != 1 {
+			t.Fatalf("%s executed %d times, want exactly 1", key, got)
+		}
+	}
+}
+
+// TestCompleteAfterDiscardIsNoOp asserts a completion cannot resurrect a key
+// that was already discarded (as a 5xx or panic releases it). The state guard
+// in Complete keeps a late writer from re-creating the entry.
+func TestCompleteAfterDiscardIsNoOp(t *testing.T) {
+	store := NewMemoryStore(time.Hour, 0)
+
+	if _, leader := store.Claim("k1", "fp"); !leader {
+		t.Fatalf("first Claim should win leadership")
+	}
+	store.Discard("k1")
+	store.Complete("k1", Response{Status: http.StatusOK})
+
+	if store.size() != 0 {
+		t.Fatalf("Complete resurrected a discarded key, size = %d", store.size())
+	}
+	if _, leader := store.Claim("k1", "fp"); !leader {
+		t.Fatalf("a discarded key should be claimable again")
+	}
+}
+
+// TestDiscardLeavesCompletedEntry asserts Discard releases only an in-flight
+// reservation; it must not delete an already-completed result that a retry
+// still needs to replay.
+func TestDiscardLeavesCompletedEntry(t *testing.T) {
+	store := NewMemoryStore(time.Hour, 0)
+
+	store.Claim("k1", "fp")
+	store.Complete("k1", Response{Status: http.StatusCreated})
+	store.Discard("k1") // ignored: the entry is completed, not in-flight
+
+	rec, leader := store.Claim("k1", "fp")
+	if leader {
+		t.Fatalf("completed entry was wrongly discarded; key was re-claimed")
+	}
+	if rec.State != StateCompleted || rec.Response.Status != http.StatusCreated {
+		t.Fatalf("completed record lost after Discard: %+v", rec)
+	}
+}
